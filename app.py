@@ -53,7 +53,7 @@ async def _fetch_following(username: str, limit: int) -> dict:
     client = hikerapi.AsyncClient(token=token, timeout=REQUEST_TIMEOUT_SECONDS)
     try:
         profile_payload = await client.user_by_username_v2(username=username)
-        user = profile_payload.get("user") if isinstance(profile_payload, dict) else None
+        user = _unwrap_user(profile_payload)
         if not isinstance(user, dict) or not user.get("pk"):
             raise LookupError(f"user '{username}' not found")
         pk = str(user["pk"])
@@ -98,6 +98,19 @@ async def _fetch_following(username: str, limit: int) -> dict:
     finally:
         if hasattr(client, "aclose"):
             await client.aclose()
+
+
+def _unwrap_user(payload) -> dict | None:
+    """HikerAPI's user endpoints sometimes wrap the user dict as
+    {"user": {...}} and sometimes return the user dict directly —
+    handle both, same as insto's HikerBackend._unwrap_user does.
+    """
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("user")
+    if isinstance(inner, dict):
+        return inner
+    return payload
 
 
 def _extract_chunk(payload) -> tuple[list, str | None]:

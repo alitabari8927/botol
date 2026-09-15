@@ -1,3 +1,0 @@
-flask>=3.0.0
-hikerapi>=0.1.0
-gunicorn>=21.2.0

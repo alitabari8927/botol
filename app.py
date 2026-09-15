@@ -18,6 +18,7 @@ import asyncio
 import os
 
 import hikerapi
+import httpx
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
@@ -37,6 +38,35 @@ def _clean_username(raw: str) -> str:
     return raw.strip().lstrip("@").strip()
 
 
+async def _raise_for_status_hook(response: httpx.Response) -> None:
+    """The raw hikerapi SDK does NOT raise on non-2xx responses — it just
+    hands back the error body as if it were normal JSON. Without this hook,
+    an invalid token / exhausted quota / banned / rate-limited response all
+    silently look like "user not found" downstream. Install this so real
+    errors surface as real exceptions instead.
+    """
+    if response.status_code >= 400:
+        await response.aread()
+        response.raise_for_status()
+
+
+def _friendly_error(exc: httpx.HTTPStatusError) -> str:
+    status = exc.response.status_code
+    if status == 401:
+        return "توکن HikerAPI نامعتبر است (401). توکن را در متغیر HIKERAPI_TOKEN چک کن."
+    if status == 402:
+        return "سهمیهٔ حساب HikerAPI تمام شده (402). باید شارژ/آپگرید کنی."
+    if status == 403:
+        return "دسترسی مسدود شده (403) — معمولاً یعنی این اندپوینت پشت لاگین است یا اکانت HikerAPI بن شده."
+    if status == 404:
+        return "همچین یوزرنیمی روی اینستاگرام پیدا نشد (404)."
+    if status == 429:
+        return "درخواست‌های زیاد، ریت‌لیمیت خوردی (429) — کمی صبر کن و دوباره امتحان کن."
+    if 500 <= status < 600:
+        return f"خطای سرور HikerAPI ({status}) — موقتی است، دوباره امتحان کن."
+    return f"خطای HikerAPI با کد {status}"
+
+
 async def _fetch_following(username: str, limit: int) -> dict:
     """Resolve `username` to a pk, then page through user_following_chunk_v1.
 
@@ -51,6 +81,9 @@ async def _fetch_following(username: str, limit: int) -> dict:
         )
 
     client = hikerapi.AsyncClient(token=token, timeout=REQUEST_TIMEOUT_SECONDS)
+    # Install the same "actually raise on errors" hook insto uses, on the
+    # underlying httpx.AsyncClient the SDK wraps.
+    client._client.event_hooks.setdefault("response", []).append(_raise_for_status_hook)
     try:
         profile_payload = await client.user_by_username_v2(username=username)
         user = _unwrap_user(profile_payload)
@@ -167,7 +200,9 @@ def api_following():
         return jsonify({"error": str(exc)}), 404
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
-    except Exception as exc:  # HikerAPI/network errors, private/login-walled, etc.
+    except httpx.HTTPStatusError as exc:
+        return jsonify({"error": _friendly_error(exc)}), 502
+    except Exception as exc:  # network errors, timeouts, etc.
         return jsonify({"error": f"خطا در گرفتن اطلاعات: {exc}"}), 502
 
     return jsonify(data)

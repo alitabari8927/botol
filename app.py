@@ -2,12 +2,12 @@
 followings-viewer — a tiny standalone web tool.
 
 Enter a public Instagram username, get back the list of accounts that
-username follows (its "following" list), via the HikerAPI service
-(https://hikerapi.com). Same API insto's `hiker` backend uses, just a
-much smaller, self-contained wrapper with a one-box web UI on top.
+username follows (its "following" list), via RocketAPI
+(https://rocketapi.io). Just a small, self-contained wrapper with a
+one-box web UI on top.
 
 Run:
-    export HIKERAPI_TOKEN=hk_live_...
+    export ROCKETAPI_TOKEN=your-rocketapi-token
     python app.py
 Then open http://127.0.0.1:8000
 """
@@ -17,79 +17,140 @@ from __future__ import annotations
 import asyncio
 import os
 
-import hikerapi
 import httpx
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
 # Hard ceiling regardless of what the client asks for, so a typo/misuse
-# can't blow through your HikerAPI quota in one request.
+# can't blow through your RocketAPI quota in one request.
 MAX_LIMIT = 1000
 DEFAULT_LIMIT = 200
 REQUEST_TIMEOUT_SECONDS = 20.0
 
+ROCKETAPI_BASE_URL = "https://v1.rocketapi.io"
+# RocketAPI's own page-size cap for the "get_following" endpoint.
+ROCKETAPI_FOLLOWING_PAGE_SIZE = 200
+
 
 def _get_token() -> str | None:
-    return os.environ.get("HIKERAPI_TOKEN")
+    return os.environ.get("ROCKETAPI_TOKEN")
 
 
 def _clean_username(raw: str) -> str:
     return raw.strip().lstrip("@").strip()
 
 
-async def _raise_for_status_hook(response: httpx.Response) -> None:
-    """The raw hikerapi SDK does NOT raise on non-2xx responses — it just
-    hands back the error body as if it were normal JSON. Without this hook,
-    an invalid token / exhausted quota / banned / rate-limited response all
-    silently look like "user not found" downstream. Install this so real
-    errors surface as real exceptions instead.
+class RocketAPIError(Exception):
+    """Raised for any RocketAPI-level failure, already carrying a
+    Persian, user-facing message plus the http status to answer with."""
+
+    def __init__(self, message: str, http_status: int = 502):
+        super().__init__(message)
+        self.message = message
+        self.http_status = http_status
+
+
+async def _rocket_post(client: httpx.AsyncClient, path: str, payload: dict) -> dict:
+    """POST to a RocketAPI endpoint and return the inner `response.body`.
+
+    RocketAPI wraps every result as:
+        {"status": "done", "response": {"status_code": 200,
+                                         "content_type": "application/json",
+                                         "body": {...actual payload...}}}
+    A non-2xx status on the *outer* HTTP call means the request to
+    RocketAPI itself failed (bad token, no credits, rate limit, RocketAPI
+    outage). A "done" envelope with an inner status_code that isn't 200
+    means Instagram itself rejected/blocked the underlying request
+    (private account, not found, login required, etc).
     """
-    if response.status_code >= 400:
-        await response.aread()
-        response.raise_for_status()
+    token = _get_token()
+    try:
+        resp = await client.post(
+            f"{ROCKETAPI_BASE_URL}/{path}",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Token {token}",
+            },
+        )
+    except httpx.RequestError as exc:
+        raise RocketAPIError(f"خطا در ارتباط با RocketAPI: {exc}", 502) from exc
+
+    if resp.status_code != 200:
+        raise RocketAPIError(_friendly_http_error(resp.status_code), 502)
+
+    try:
+        envelope = resp.json()
+    except ValueError as exc:
+        raise RocketAPIError("پاسخ نامعتبر از RocketAPI دریافت شد.", 502) from exc
+
+    if not isinstance(envelope, dict) or envelope.get("status") != "done":
+        raise RocketAPIError(
+            f"RocketAPI درخواست را کامل نکرد: {envelope}", 502
+        )
+
+    inner = envelope.get("response") or {}
+    inner_status = inner.get("status_code")
+    body = inner.get("body")
+
+    if inner_status != 200 or not isinstance(body, dict):
+        raise RocketAPIError(_friendly_inner_error(inner_status, body), 502)
+
+    return body
 
 
-def _friendly_error(exc: httpx.HTTPStatusError) -> str:
-    status = exc.response.status_code
+def _friendly_http_error(status: int) -> str:
     if status == 401:
-        return "توکن HikerAPI نامعتبر است (401). توکن را در متغیر HIKERAPI_TOKEN چک کن."
+        return "توکن RocketAPI نامعتبر است (401). توکن را در متغیر ROCKETAPI_TOKEN چک کن."
     if status == 402:
-        return "سهمیهٔ حساب HikerAPI تمام شده (402). باید شارژ/آپگرید کنی."
+        return "سهمیهٔ حساب RocketAPI تمام شده (402). باید شارژ/آپگرید کنی."
     if status == 403:
-        return "دسترسی مسدود شده (403) — معمولاً یعنی این اندپوینت پشت لاگین است یا اکانت HikerAPI بن شده."
-    if status == 404:
-        return "همچین یوزرنیمی روی اینستاگرام پیدا نشد (404)."
+        return "دسترسی مسدود شده (403) — توکن یا حساب RocketAPI مشکل دارد."
     if status == 429:
         return "درخواست‌های زیاد، ریت‌لیمیت خوردی (429) — کمی صبر کن و دوباره امتحان کن."
     if 500 <= status < 600:
-        return f"خطای سرور HikerAPI ({status}) — موقتی است، دوباره امتحان کن."
-    return f"خطای HikerAPI با کد {status}"
+        return f"خطای سرور RocketAPI ({status}) — موقتی است، دوباره امتحان کن."
+    return f"خطای RocketAPI با کد {status}"
+
+
+def _friendly_inner_error(inner_status: int | None, body) -> str:
+    # Instagram-side rejection surfaced through RocketAPI. `body` is often
+    # a dict with a "message"/"error_type" even when status_code != 200.
+    message = ""
+    if isinstance(body, dict):
+        message = str(body.get("message") or body.get("error_type") or "")
+
+    if inner_status == 404:
+        return "همچین یوزرنیمی روی اینستاگرام پیدا نشد (404)."
+    if inner_status in (400, 401) and "login_required" in message.lower():
+        return "برای این حساب (احتمالاً private) نیاز به لاگین است و RocketAPI بدون لاگین نمی‌تواند لیست را بگیرد."
+    if inner_status == 429:
+        return "اینستاگرام موقتاً ریت‌لیمیت کرده — کمی صبر کن و دوباره امتحان کن."
+    if inner_status:
+        return f"اینستاگرام درخواست را رد کرد (کد {inner_status})" + (f": {message}" if message else "")
+    return f"پاسخ غیرمنتظره از RocketAPI: {body}"
 
 
 async def _fetch_following(username: str, limit: int) -> dict:
-    """Resolve `username` to a pk, then page through user_following_chunk_v1.
-
-    Mirrors insto's HikerBackend.resolve_target + iter_user_following, but
-    inlined here so this project has no dependency on insto itself.
-    """
+    """Resolve `username` to a numeric id, then page through
+    instagram/user/get_following until `limit` accounts are collected."""
     token = _get_token()
     if not token:
         raise RuntimeError(
-            "HIKERAPI_TOKEN is not set on the server. Set it as an "
+            "ROCKETAPI_TOKEN is not set on the server. Set it as an "
             "environment variable before starting app.py."
         )
 
-    client = hikerapi.AsyncClient(token=token, timeout=REQUEST_TIMEOUT_SECONDS)
-    # Install the same "actually raise on errors" hook insto uses, on the
-    # underlying httpx.AsyncClient the SDK wraps.
-    client._client.event_hooks.setdefault("response", []).append(_raise_for_status_hook)
-    try:
-        profile_payload = await client.user_by_username_v2(username=username)
-        user = _unwrap_user(profile_payload)
-        if not isinstance(user, dict) or not user.get("pk"):
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        profile_body = await _rocket_post(
+            client, "instagram/user/get_web_profile_info", {"username": username}
+        )
+        user = _unwrap_profile_user(profile_body)
+        if not isinstance(user, dict) or not user.get("id"):
             raise LookupError(f"user '{username}' not found")
-        pk = str(user["pk"])
+
+        user_id = int(user["id"])
         target_is_private = bool(user.get("is_private", False))
 
         results: list[dict] = []
@@ -97,9 +158,16 @@ async def _fetch_following(username: str, limit: int) -> dict:
         seen_cursors: set[str] = set()
 
         while len(results) < limit:
-            payload = await client.user_following_chunk_v1(user_id=pk, max_id=cursor)
+            page_payload: dict = {
+                "id": user_id,
+                "count": min(ROCKETAPI_FOLLOWING_PAGE_SIZE, limit - len(results)),
+            }
+            if cursor:
+                page_payload["max_id"] = cursor
 
-            items, next_cursor = _extract_chunk(payload)
+            body = await _rocket_post(client, "instagram/user/get_following", page_payload)
+            items, next_cursor = _extract_following_page(body)
+
             for item in items:
                 if not isinstance(item, dict) or not item.get("pk"):
                     continue
@@ -116,61 +184,52 @@ async def _fetch_following(username: str, limit: int) -> dict:
                 if len(results) >= limit:
                     break
 
-            if not next_cursor or next_cursor in seen_cursors:
+            if not next_cursor or next_cursor in seen_cursors or not items:
                 break
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
         return {
             "username": username,
-            "pk": pk,
+            "pk": str(user_id),
             "target_is_private": target_is_private,
             "count": len(results),
             "following": results,
         }
-    finally:
-        if hasattr(client, "aclose"):
-            await client.aclose()
 
 
-def _unwrap_user(payload) -> dict | None:
-    """HikerAPI's user endpoints sometimes wrap the user dict as
-    {"user": {...}} and sometimes return the user dict directly —
-    handle both, same as insto's HikerBackend._unwrap_user does.
-    """
-    if not isinstance(payload, dict):
-        return None
-    inner = payload.get("user")
-    if isinstance(inner, dict):
-        return inner
-    return payload
+def _unwrap_profile_user(body: dict) -> dict | None:
+    """`get_web_profile_info` mirrors Instagram's own web endpoint shape:
+    {"data": {"user": {...}}, "status": "ok"} — but fall back to a
+    top-level "user" key or the raw body, in case RocketAPI changes it."""
+    data = body.get("data")
+    if isinstance(data, dict) and isinstance(data.get("user"), dict):
+        return data["user"]
+    if isinstance(body.get("user"), dict):
+        return body["user"]
+    if body.get("id"):
+        return body
+    return None
 
 
-def _extract_chunk(payload) -> tuple[list, str | None]:
-    """Same three response shapes HikerAPI's chunk endpoints can return."""
-    if isinstance(payload, list) and len(payload) == 2:
-        raw_items, raw_cursor = payload
-        items = list(raw_items) if isinstance(raw_items, list) else []
-        cursor = None if raw_cursor in (None, False, "") else str(raw_cursor)
-        return items, cursor
+def _extract_following_page(body: dict) -> tuple[list, str | None]:
+    """`get_following` mirrors Instagram's private "following" endpoint
+    shape: {"users": [...], "next_max_id": ..., "status": "ok"}."""
+    items = []
+    for key in ("users", "items"):
+        candidate = body.get(key)
+        if isinstance(candidate, list):
+            items = candidate
+            break
 
-    if isinstance(payload, dict):
-        inner = payload.get("response") if isinstance(payload.get("response"), dict) else payload
-        items = []
-        for key in ("users", "items"):
-            candidate = inner.get(key)
-            if isinstance(candidate, list):
-                items = candidate
-                break
-        cursor = None
-        for key in ("next_max_id", "next_page_id", "end_cursor", "next_min_id"):
-            value = inner.get(key, payload.get(key))
-            if value not in (None, False, ""):
-                cursor = str(value)
-                break
-        return items, cursor
+    cursor = None
+    for key in ("next_max_id", "next_page_id", "end_cursor", "next_min_id"):
+        value = body.get(key)
+        if value not in (None, False, ""):
+            cursor = str(value)
+            break
 
-    return [], None
+    return items, cursor
 
 
 @app.get("/")
@@ -192,7 +251,7 @@ def api_following():
     limit = max(1, min(limit, MAX_LIMIT))
 
     if not _get_token():
-        return jsonify({"error": "HIKERAPI_TOKEN روی سرور تنظیم نشده."}), 500
+        return jsonify({"error": "ROCKETAPI_TOKEN روی سرور تنظیم نشده."}), 500
 
     try:
         data = asyncio.run(_fetch_following(username, limit))
@@ -200,8 +259,8 @@ def api_following():
         return jsonify({"error": str(exc)}), 404
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
-    except httpx.HTTPStatusError as exc:
-        return jsonify({"error": _friendly_error(exc)}), 502
+    except RocketAPIError as exc:
+        return jsonify({"error": exc.message}), exc.http_status
     except Exception as exc:  # network errors, timeouts, etc.
         return jsonify({"error": f"خطا در گرفتن اطلاعات: {exc}"}), 502
 
